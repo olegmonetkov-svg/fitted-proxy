@@ -1,4 +1,3 @@
-
 const express = require('express');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -12,7 +11,6 @@ const PORT = process.env.PORT || 3000;
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 1000 * 60 * 60 * 6);
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 12000);
 const MAX_IMAGE_BYTES = Number(process.env.MAX_IMAGE_BYTES || 8 * 1024 * 1024);
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : `http://localhost:${PORT}`);
 const FALLBACK_PNG = fs.readFileSync(path.join(__dirname, 'fallback.png'));
 
 const cache = new Map();
@@ -51,6 +49,21 @@ function extFrom(contentType, url) {
   return 'jpg';
 }
 
+function getPublicBaseUrl(req) {
+  const envBase = process.env.PUBLIC_BASE_URL || process.env.RAILWAY_STATIC_URL || '';
+  if (envBase && /^https?:\/\//i.test(envBase)) return envBase.replace(/\/$/, '');
+
+  const protoHeader = (req.headers['x-forwarded-proto'] || '').toString().split(',')[0].trim();
+  const protocol = protoHeader || req.protocol || 'https';
+  const host = (req.headers['x-forwarded-host'] || req.headers.host || '').toString().split(',')[0].trim();
+  if (host) return `${protocol}://${host}`.replace(/\/$/, '');
+
+  if (process.env.RAILWAY_PUBLIC_DOMAIN) {
+    return `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`;
+  }
+  return `http://localhost:${PORT}`;
+}
+
 async function fetchImage(sourceUrl) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -77,7 +90,7 @@ async function fetchImage(sourceUrl) {
   }
 }
 
-function putInCache(buffer, contentType, originalUrl) {
+function putInCache(buffer, contentType, originalUrl, publicBaseUrl) {
   const id = crypto.randomBytes(12).toString('hex');
   const extension = extFrom(contentType, originalUrl);
   cache.set(id, {
@@ -87,7 +100,7 @@ function putInCache(buffer, contentType, originalUrl) {
     expiresAt: now() + CACHE_TTL_MS,
     originalUrl
   });
-  return `${PUBLIC_BASE_URL}/image/${id}.${extension}`;
+  return `${publicBaseUrl}/image/${id}.${extension}`;
 }
 
 function getCandidates(req) {
@@ -109,12 +122,13 @@ function getCandidates(req) {
   return out;
 }
 
-app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'fitted-image-proxy', cacheItems: cache.size });
+app.get('/health', (req, res) => {
+  res.json({ ok: true, service: 'fitted-image-proxy', cacheItems: cache.size, baseUrl: getPublicBaseUrl(req) });
 });
 
 app.all('/select-images', async (req, res) => {
   try {
+    const publicBaseUrl = getPublicBaseUrl(req);
     const candidates = getCandidates(req);
     const selected = [];
     const errors = [];
@@ -123,7 +137,7 @@ app.all('/select-images', async (req, res) => {
       if (selected.length >= 3) break;
       try {
         const { buffer, contentType } = await fetchImage(candidate);
-        selected.push(putInCache(buffer, contentType, candidate));
+        selected.push(putInCache(buffer, contentType, candidate, publicBaseUrl));
       } catch (err) {
         errors.push({ url: candidate, error: String(err.message || err) });
       }
@@ -131,7 +145,7 @@ app.all('/select-images', async (req, res) => {
 
     let usedFallback = false;
     if (selected.length === 0) {
-      const fallbackUrl = putInCache(FALLBACK_PNG, 'image/png', 'fallback');
+      const fallbackUrl = putInCache(FALLBACK_PNG, 'image/png', 'fallback', publicBaseUrl);
       selected.push(fallbackUrl, fallbackUrl, fallbackUrl);
       usedFallback = true;
     } else {
@@ -151,7 +165,8 @@ app.all('/select-images', async (req, res) => {
       debugErrors: errors.slice(0, 10)
     });
   } catch (err) {
-    const fallbackUrl = putInCache(FALLBACK_PNG, 'image/png', 'fallback');
+    const publicBaseUrl = getPublicBaseUrl(req);
+    const fallbackUrl = putInCache(FALLBACK_PNG, 'image/png', 'fallback', publicBaseUrl);
     res.json({
       ok: true,
       count: 3,
